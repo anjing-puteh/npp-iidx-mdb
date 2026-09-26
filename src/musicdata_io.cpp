@@ -2,13 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
-#include <unordered_map>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #ifndef NOMINMAX
@@ -28,62 +30,141 @@ static bool is_supported_version(uint32_t v) {
   return false;
 }
 
-static std::string utf16le_to_utf8(const uint8_t* data, size_t nbytes) {
-  if (nbytes < 2) return {};
+static void assign_utf8_from_wide(std::string& out, const WCHAR* pw, int wlen) {
+  if (wlen <= 0) {
+    out.clear();
+    return;
+  }
+  // Largest musicdata string is 0x100 bytes. 256 UTF-16 code units expand to at most 768 UTF-8 bytes.
+  char u8buf[768];
+  int u8len = WideCharToMultiByte(CP_UTF8, 0, pw, wlen, u8buf, static_cast<int>(sizeof(u8buf)), nullptr, nullptr);
+  if (u8len > 0) {
+    out.assign(u8buf, static_cast<size_t>(u8len));
+    return;
+  }
+  u8len = WideCharToMultiByte(CP_UTF8, 0, pw, wlen, nullptr, 0, nullptr, nullptr);
+  if (u8len <= 0) {
+    out.clear();
+    return;
+  }
+  out.resize(static_cast<size_t>(u8len));
+  WideCharToMultiByte(CP_UTF8, 0, pw, wlen, out.data(), u8len, nullptr, nullptr);
+}
+
+static bool size_fits_win32_int(size_t n) { return n <= static_cast<size_t>((std::numeric_limits<int>::max)()); }
+
+static void assign_utf16(std::string& out, const uint8_t* data, size_t nbytes) {
+  if (nbytes < 2) {
+    out.clear();
+    return;
+  }
   size_t nwchar = nbytes / 2;
   const WCHAR* pw = reinterpret_cast<const WCHAR*>(data);
   while (nwchar > 0 && pw[nwchar - 1] == 0) --nwchar;
-  if (nwchar == 0) return {};
-  int out = WideCharToMultiByte(CP_UTF8, 0, pw, (int)nwchar, nullptr, 0, nullptr, nullptr);
-  if (out <= 0) return {};
-  std::string u8(static_cast<size_t>(out), '\0');
-  WideCharToMultiByte(CP_UTF8, 0, pw, (int)nwchar, &u8[0], out, nullptr, nullptr);
-  return u8;
+  if (nwchar == 0) {
+    out.clear();
+    return;
+  }
+  if (!size_fits_win32_int(nwchar)) {
+    out.clear();
+    return;
+  }
+  bool ascii = true;
+  for (size_t i = 0; i < nwchar; ++i) {
+    if (pw[i] >= 0x80) {
+      ascii = false;
+      break;
+    }
+  }
+  if (ascii) {
+    out.resize(nwchar);
+    for (size_t i = 0; i < nwchar; ++i) out[i] = static_cast<char>(pw[i]);
+    return;
+  }
+  assign_utf8_from_wide(out, pw, static_cast<int>(nwchar));
 }
 
-static std::string cp932_to_utf8(const uint8_t* data, size_t nbytes) {
+static void assign_cp932(std::string& out, const uint8_t* data, size_t nbytes) {
   size_t z = 0;
   while (z < nbytes && data[z] != 0) ++z;
-  if (z == 0) return {};
-  int wlen = MultiByteToWideChar(932, MB_PRECOMPOSED | MB_ERR_INVALID_CHARS, reinterpret_cast<LPCCH>(data), (int)z, nullptr, 0);
-  if (wlen <= 0) {
-    wlen = MultiByteToWideChar(932, MB_PRECOMPOSED, reinterpret_cast<LPCCH>(data), (int)z, nullptr, 0);
+  if (z == 0) {
+    out.clear();
+    return;
   }
-  if (wlen <= 0) return {};
-  std::wstring w(wlen, L'\0');
-  MultiByteToWideChar(932, MB_PRECOMPOSED, reinterpret_cast<LPCCH>(data), (int)z, &w[0], wlen);
-  int u8len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-  if (u8len <= 1) return {};
-  std::string out(u8len - 1, '\0');
-  WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &out[0], u8len, nullptr, nullptr);
-  return out;
+  if (!size_fits_win32_int(z)) {
+    out.clear();
+    return;
+  }
+  bool ascii = true;
+  for (size_t i = 0; i < z; ++i) {
+    if (data[i] >= 0x80) {
+      ascii = false;
+      break;
+    }
+  }
+  if (ascii) {
+    out.assign(reinterpret_cast<const char*>(data), z);
+    return;
+  }
+  wchar_t wbuf[0x101];
+  int wlen = MultiByteToWideChar(932, MB_PRECOMPOSED | MB_ERR_INVALID_CHARS, reinterpret_cast<LPCCH>(data), static_cast<int>(z), wbuf, 0x100);
+  if (wlen <= 0) wlen = MultiByteToWideChar(932, MB_PRECOMPOSED, reinterpret_cast<LPCCH>(data), static_cast<int>(z), wbuf, 0x100);
+  if (wlen <= 0) {
+    wlen = MultiByteToWideChar(932, MB_PRECOMPOSED, reinterpret_cast<LPCCH>(data), static_cast<int>(z), nullptr, 0);
+    if (wlen <= 0) {
+      out.clear();
+      return;
+    }
+    std::wstring w(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(932, MB_PRECOMPOSED, reinterpret_cast<LPCCH>(data), static_cast<int>(z), w.data(), wlen);
+    assign_utf8_from_wide(out, w.data(), wlen);
+    return;
+  }
+  assign_utf8_from_wide(out, wbuf, wlen);
 }
 
-static std::string read_string_cp932(const uint8_t* p, size_t len) { return cp932_to_utf8(p, len); }
-
-static std::string read_string_utf16(const uint8_t* p, size_t len) { return utf16le_to_utf8(p, len); }
-
 struct BinReader {
-  const uint8_t* base;
-  size_t size;
+  const uint8_t* base = nullptr;
+  size_t size = 0;
   size_t pos = 0;
+  bool ok = true;
 
-  bool require(size_t n) const { return pos + n <= size; }
+  // Overflow-safe: n bytes available from pos.
+  bool require(size_t n) const { return ok && n <= size - pos; }
 
-  void skip(size_t n) { pos += n; }
+  void fail() { ok = false; }
+
+  void skip(size_t n) {
+    if (!require(n)) {
+      fail();
+      return;
+    }
+    pos += n;
+  }
 
   uint8_t u8() {
-    uint8_t v = base[pos++];
-    return v;
+    if (!require(1)) {
+      fail();
+      return 0;
+    }
+    return base[pos++];
   }
 
   uint16_t u16le() {
+    if (!require(2)) {
+      fail();
+      return 0;
+    }
     uint16_t v = static_cast<uint16_t>(base[pos] | (base[pos + 1] << 8));
     pos += 2;
     return v;
   }
 
   uint32_t u32le() {
+    if (!require(4)) {
+      fail();
+      return 0;
+    }
     uint32_t v = static_cast<uint32_t>(base[pos] | (base[pos + 1] << 8u) | (base[pos + 2] << 16u) | (base[pos + 3] << 24u));
     pos += 4;
     return v;
@@ -100,11 +181,22 @@ struct BinReader {
   }
 
   void read_bytes(uint8_t* dst, size_t n) {
+    if (!require(n)) {
+      fail();
+      if (n) memset(dst, 0, n);
+      return;
+    }
     memcpy(dst, base + pos, n);
     pos += n;
   }
 
+  // Largest string field is 0x100 bytes; keep a zero pad for failed ptr() calls.
   const uint8_t* ptr(size_t n) {
+    static const uint8_t kZeroPad[0x100] = {};
+    if (!require(n)) {
+      fail();
+      return kZeroPad;
+    }
     const uint8_t* r = base + pos;
     pos += n;
     return r;
@@ -139,68 +231,120 @@ struct BinWriter {
   void write_unk(const uint8_t* p, size_t n) { raw(p, n); }
 };
 
-static void utf8_to_cp932_bytes(const std::string& utf8, size_t max_codepoints, std::vector<uint8_t>& out) {
-  out.clear();
+// Byte length of the first max_codepoints UTF-8 code points. ascii is true when every byte in that prefix is < 0x80.
+static void utf8_field_prefix(const std::string& utf8, size_t max_codepoints, size_t& byte_len, bool& ascii) {
   size_t i = 0;
   size_t cp = 0;
-  while (i < utf8.size() && cp < max_codepoints) {
-    unsigned char c = static_cast<unsigned char>(utf8[i]);
+  ascii = true;
+  const size_t n = utf8.size();
+  const char* s = utf8.data();
+  while (i < n && cp < max_codepoints) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
     size_t inc = 1;
-    if (c >= 0xf0) inc = 4;
-    else if (c >= 0xe0)
-      inc = 3;
-    else if (c >= 0xc0)
-      inc = 2;
-    if (i + inc > utf8.size()) break;
+    if (c >= 0x80) {
+      ascii = false;
+      if (c >= 0xf0) inc = 4;
+      else if (c >= 0xe0)
+        inc = 3;
+      else if (c >= 0xc0)
+        inc = 2;
+    }
+    if (i + inc > n) break;
     i += inc;
     ++cp;
   }
-  std::string slice = utf8.substr(0, i);
-  int wlen = MultiByteToWideChar(CP_UTF8, 0, slice.c_str(), -1, nullptr, 0);
-  if (wlen <= 1) return;
-  std::wstring w(static_cast<size_t>(wlen - 1), L'\0');
-  MultiByteToWideChar(CP_UTF8, 0, slice.c_str(), -1, &w[0], wlen);
-  int n = WideCharToMultiByte(932, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-  if (n <= 0) return;
-  out.resize(static_cast<size_t>(n));
-  WideCharToMultiByte(932, 0, w.c_str(), (int)w.size(), reinterpret_cast<LPSTR>(out.data()), n, nullptr, nullptr);
-}
-
-static void utf8_to_utf16le_bytes(const std::string& utf8, size_t max_codepoints, std::vector<uint8_t>& out) {
-  out.clear();
-  size_t i = 0;
-  size_t cp = 0;
-  while (i < utf8.size() && cp < max_codepoints) {
-    unsigned char c = static_cast<unsigned char>(utf8[i]);
-    size_t inc = 1;
-    if (c >= 0xf0) inc = 4;
-    else if (c >= 0xe0)
-      inc = 3;
-    else if (c >= 0xc0)
-      inc = 2;
-    if (i + inc > utf8.size()) break;
-    i += inc;
-    ++cp;
-  }
-  std::string slice = utf8.substr(0, i);
-  int wlen = MultiByteToWideChar(CP_UTF8, 0, slice.c_str(), -1, nullptr, 0);
-  if (wlen <= 1) return;
-  std::wstring w(static_cast<size_t>(wlen - 1), L'\0');
-  MultiByteToWideChar(CP_UTF8, 0, slice.c_str(), -1, &w[0], wlen);
-  out.resize(w.size() * 2);
-  memcpy(out.data(), w.data(), out.size());
+  byte_len = i;
 }
 
 static void write_string_field(BinWriter& w, const std::string& utf8, size_t field_bytes, bool utf16) {
-  std::vector<uint8_t> enc;
-  if (utf16) {
-    utf8_to_utf16le_bytes(utf8, field_bytes, enc);
-  } else {
-    utf8_to_cp932_bytes(utf8, field_bytes, enc);
+  // Every on-disk string field is at most 0x100 bytes. Heap fallback covers anything larger.
+  uint8_t stack[0x100];
+  std::vector<uint8_t> heap;
+  uint8_t* field = stack;
+  if (field_bytes > sizeof(stack)) {
+    heap.assign(field_bytes, 0);
+    field = heap.data();
+  } else if (field_bytes > 0) {
+    memset(stack, 0, field_bytes);
   }
-  if (enc.size() > field_bytes) enc.resize(field_bytes);
-  w.raw(enc.data(), enc.size());
-  if (enc.size() < field_bytes) w.pad0(field_bytes - enc.size());
+
+  size_t byte_len = 0;
+  bool ascii = true;
+  utf8_field_prefix(utf8, field_bytes, byte_len, ascii);
+  if (byte_len == 0) {
+    w.raw(field, field_bytes);
+    return;
+  }
+  if (!size_fits_win32_int(byte_len)) {
+    w.raw(field, field_bytes);
+    return;
+  }
+
+  if (ascii) {
+    if (!utf16) {
+      memcpy(field, utf8.data(), byte_len);
+    } else {
+      size_t nchars = byte_len;
+      if (nchars * 2 > field_bytes) nchars = field_bytes / 2;
+      const char* s = utf8.data();
+      for (size_t i = 0; i < nchars; ++i) field[i * 2] = static_cast<uint8_t>(s[i]);
+      // Match the previous byte-truncate: an odd field width keeps one trailing low byte.
+      if ((field_bytes & 1u) && byte_len * 2 > field_bytes) field[field_bytes - 1] = static_cast<uint8_t>(s[field_bytes / 2]);
+    }
+    w.raw(field, field_bytes);
+    return;
+  }
+
+  wchar_t wbuf[0x200];
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(byte_len), wbuf, 0x200);
+  if (wlen <= 0) {
+    wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(byte_len), nullptr, 0);
+    if (wlen <= 0) {
+      w.raw(field, field_bytes);
+      return;
+    }
+    std::wstring wide(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(byte_len), wide.data(), wlen);
+    if (utf16) {
+      size_t nbytes = static_cast<size_t>(wlen) * 2;
+      if (nbytes > field_bytes) nbytes = field_bytes;
+      memcpy(field, wide.data(), nbytes);
+    } else {
+      int n = WideCharToMultiByte(932, 0, wide.data(), wlen, nullptr, 0, nullptr, nullptr);
+      if (n > 0) {
+        std::vector<char> tmp(static_cast<size_t>(n));
+        WideCharToMultiByte(932, 0, wide.data(), wlen, tmp.data(), n, nullptr, nullptr);
+        size_t copy = static_cast<size_t>(n);
+        if (copy > field_bytes) copy = field_bytes;
+        memcpy(field, tmp.data(), copy);
+      }
+    }
+    w.raw(field, field_bytes);
+    return;
+  }
+
+  if (utf16) {
+    size_t nbytes = static_cast<size_t>(wlen) * 2;
+    if (nbytes > field_bytes) nbytes = field_bytes;
+    memcpy(field, wbuf, nbytes);
+  } else {
+    char cbuf[0x200];
+    int n = WideCharToMultiByte(932, 0, wbuf, wlen, cbuf, static_cast<int>(sizeof(cbuf)), nullptr, nullptr);
+    if (n <= 0) {
+      n = WideCharToMultiByte(932, 0, wbuf, wlen, nullptr, 0, nullptr, nullptr);
+      if (n > 0) {
+        std::vector<char> tmp(static_cast<size_t>(n));
+        WideCharToMultiByte(932, 0, wbuf, wlen, tmp.data(), n, nullptr, nullptr);
+        size_t copy = static_cast<size_t>(n);
+        if (copy > field_bytes) copy = field_bytes;
+        memcpy(field, tmp.data(), copy);
+      }
+    } else {
+      if (static_cast<size_t>(n) > field_bytes) n = static_cast<int>(field_bytes);
+      memcpy(field, cbuf, static_cast<size_t>(n));
+    }
+  }
+  w.raw(field, field_bytes);
 }
 
 struct SongScratch {
@@ -343,8 +487,9 @@ static void write_one_song_typed(BinWriter& bw, uint32_t version, const SongData
   bw.u32le(s.afp_flag);
 
   const int afp_count = (version >= 22) ? 10 : 9;
+  static const std::string kEmpty;
   for (int idx = 0; idx < afp_count; ++idx) {
-    const std::string& x = (idx < s.afp_data_count) ? s.afp_data[static_cast<size_t>(idx)] : std::string{};
+    const std::string& x = (idx < s.afp_data_count) ? s.afp_data[static_cast<size_t>(idx)] : kEmpty;
     write_string_field(bw, x, 0x20, false);
   }
 
@@ -352,17 +497,39 @@ static void write_one_song_typed(BinWriter& bw, uint32_t version, const SongData
 }
 
 
+// Fixed song-record sizes from write_one_song_typed. Used only to reserve the output buffer.
+static size_t song_record_bytes(uint32_t version) {
+  if (version == 80) return 1584;
+  if (version >= 32) return 2040;
+  if (version >= 27) return 1324;
+  if (version >= 26) return 836;
+  if (version >= 22) return 832;
+  return 800;
+}
+
 static void writer_impl_typed(uint32_t version, BinWriter& bw, const std::vector<SongData>& songs) {
   const int song_count = static_cast<int>(songs.size());
-  std::unordered_map<uint32_t, int> exist_ids;
-  exist_ids.reserve(songs.size());
-  for (int i = 0; i < song_count; ++i) {
-    exist_ids[songs[static_cast<size_t>(i)].song_id] = i;
-  }
-
   uint32_t cur_style_entries = version * 1000u;
   uint32_t max_entries = cur_style_entries + 1000u;
   bool wide_index = (version >= 32 && version != 80);
+  const size_t entry_sz = wide_index ? 4u : 2u;
+
+  // Last duplicate song_id wins, matching the previous unordered_map assignment.
+  std::vector<std::pair<uint32_t, int>> order;
+  order.reserve(static_cast<size_t>(song_count));
+  for (int i = 0; i < song_count; ++i) order.emplace_back(songs[static_cast<size_t>(i)].song_id, i);
+  std::stable_sort(order.begin(), order.end(), [](const std::pair<uint32_t, int>& a, const std::pair<uint32_t, int>& b) { return a.first < b.first; });
+
+  std::vector<std::pair<uint32_t, int>> uniq;
+  uniq.reserve(order.size());
+  for (size_t i = 0; i < order.size();) {
+    size_t j = i + 1;
+    while (j < order.size() && order[j].first == order[i].first) ++j;
+    uniq.push_back(order[j - 1]);
+    i = j;
+  }
+
+  bw.buf.reserve(16 + static_cast<size_t>(max_entries) * entry_sz + static_cast<size_t>(song_count) * song_record_bytes(version));
 
   bw.raw("IIDX", 4);
   if (version >= 32) {
@@ -377,34 +544,32 @@ static void writer_impl_typed(uint32_t version, BinWriter& bw, const std::vector
     bw.u32le(0);
   }
 
-  int current_song = 0;
-  std::vector<uint32_t> sorted_keys;
-  sorted_keys.reserve(exist_ids.size());
-  for (const auto& kv : exist_ids) sorted_keys.push_back(kv.first);
-  std::sort(sorted_keys.begin(), sorted_keys.end());
+  const size_t index_off = bw.buf.size();
+  const size_t index_bytes = static_cast<size_t>(max_entries) * entry_sz;
+  bw.buf.resize(index_off + index_bytes, 0);
+  uint8_t* index = bw.buf.data() + index_off;
+  const size_t neg_bytes = static_cast<size_t>(cur_style_entries) * entry_sz;
+  if (neg_bytes) memset(index, 0xFF, neg_bytes);
 
-  for (uint32_t i = 0; i < max_entries; ++i) {
-    auto it = exist_ids.find(i);
-    if (it != exist_ids.end()) {
-      if (wide_index)
-        bw.i32le(current_song++);
-      else
-        bw.i16le(static_cast<int16_t>(current_song++));
-    } else if (i >= cur_style_entries) {
-      if (wide_index)
-        bw.i32le(0);
-      else
-        bw.i16le(0);
+  for (size_t rank = 0; rank < uniq.size(); ++rank) {
+    const uint32_t id = uniq[rank].first;
+    if (id >= max_entries) continue;
+    uint8_t* slot = index + static_cast<size_t>(id) * entry_sz;
+    if (wide_index) {
+      const uint32_t u = static_cast<uint32_t>(static_cast<int>(rank));
+      slot[0] = static_cast<uint8_t>(u);
+      slot[1] = static_cast<uint8_t>(u >> 8);
+      slot[2] = static_cast<uint8_t>(u >> 16);
+      slot[3] = static_cast<uint8_t>(u >> 24);
     } else {
-      if (wide_index)
-        bw.i32le(-1);
-      else
-        bw.i16le(static_cast<int16_t>(-1));
+      const uint16_t u = static_cast<uint16_t>(static_cast<int16_t>(rank));
+      slot[0] = static_cast<uint8_t>(u);
+      slot[1] = static_cast<uint8_t>(u >> 8);
     }
   }
 
-  for (uint32_t k : sorted_keys) {
-    int idx = exist_ids[k];
+  for (const auto& e : uniq) {
+    const int idx = e.second;
     if (idx < 0 || idx >= song_count) continue;
     write_one_song_typed(bw, version, songs[static_cast<size_t>(idx)]);
   }
@@ -418,17 +583,27 @@ static void append_indent_units(std::string& out, int indent_units) {
   out.append(static_cast<size_t>(indent_units) * static_cast<size_t>(kJsonIndentCols), ' ');
 }
 
-static void append_json_int(std::string& out, long long v) {
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "%lld", v);
-  out.append(buf);
+static void append_u64_digits(std::string& out, uint64_t u) {
+  char buf[20];
+  char* p = buf + sizeof(buf);
+  do {
+    *--p = static_cast<char>('0' + static_cast<unsigned>(u % 10));
+    u /= 10;
+  } while (u);
+  out.append(p, static_cast<size_t>((buf + sizeof(buf)) - p));
 }
 
-static void append_json_u32(std::string& out, uint32_t v) {
-  char buf[16];
-  std::snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(v));
-  out.append(buf);
+static void append_json_int(std::string& out, long long v) {
+  if (v < 0) {
+    out.push_back('-');
+    // Works for LLONG_MIN, where negating the value itself is undefined.
+    append_u64_digits(out, static_cast<uint64_t>(-(v + 1)) + 1ull);
+    return;
+  }
+  append_u64_digits(out, static_cast<uint64_t>(v));
 }
+
+static void append_json_u32(std::string& out, uint32_t v) { append_u64_digits(out, v); }
 
 static void append_json_i16(std::string& out, int16_t v) { append_json_int(out, static_cast<long long>(v)); }
 static void append_json_i32(std::string& out, int32_t v) { append_json_int(out, static_cast<long long>(v)); }
@@ -436,12 +611,24 @@ static void append_json_u16(std::string& out, uint16_t v) { append_json_int(out,
 
 static void append_escaped_json_string(std::string& out, const char* input) {
   out.push_back('"');
-  if (!input) {
+  if (!input || !*input) {
     out.push_back('"');
     return;
   }
-  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(input); *p; ++p) {
-    switch (*p) {
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(input);
+  const unsigned char* chunk = p;
+  for (;;) {
+    const unsigned char c = *p;
+    if (c == 0) {
+      out.append(reinterpret_cast<const char*>(chunk), static_cast<size_t>(p - chunk));
+      break;
+    }
+    if (c >= 0x20 && c != '"' && c != '\\') {
+      ++p;
+      continue;
+    }
+    if (p != chunk) out.append(reinterpret_cast<const char*>(chunk), static_cast<size_t>(p - chunk));
+    switch (c) {
       case '"':
         out.append("\\\"");
         break;
@@ -463,16 +650,15 @@ static void append_escaped_json_string(std::string& out, const char* input) {
       case '\t':
         out.append("\\t");
         break;
-      default:
-        if (*p < 32) {
-          char buf[7];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", *p);
-          out.append(buf);
-        } else {
-          out.push_back(static_cast<char>(*p));
-        }
+      default: {
+        char buf[7];
+        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+        out.append(buf);
         break;
+      }
     }
+    ++p;
+    chunk = p;
   }
   out.push_back('"');
 }
@@ -481,7 +667,7 @@ static void append_afp_data_from_bin_python(std::string& out, BinReader& br, uin
   const int afp_n = (version >= 22) ? 10 : 9;
   out += "[\n";
   for (int i = 0; i < afp_n; ++i) {
-    scratch.afp_entry = read_string_cp932(br.ptr(0x20), 0x20);
+    assign_cp932(scratch.afp_entry, br.ptr(0x20), 0x20);
     append_indent_units(out, key_line_indent_units + 1);
     append_escaped_json_string(out, scratch.afp_entry.c_str());
     if (i + 1 < afp_n)
@@ -498,21 +684,21 @@ static void append_one_song_from_bin_python(std::string& out, BinReader& br, uin
   scratch.subtitle.clear();
 
   if (version == 80) {
-    scratch.title = read_string_cp932(br.ptr(0x80), 0x80);
-    scratch.title_ascii = read_string_cp932(br.ptr(0x40), 0x40);
-    scratch.genre = read_string_cp932(br.ptr(0x80), 0x80);
-    scratch.artist = read_string_cp932(br.ptr(0x80), 0x80);
+    assign_cp932(scratch.title, br.ptr(0x80), 0x80);
+    assign_cp932(scratch.title_ascii, br.ptr(0x40), 0x40);
+    assign_cp932(scratch.genre, br.ptr(0x80), 0x80);
+    assign_cp932(scratch.artist, br.ptr(0x80), 0x80);
   } else if (version >= 32) {
-    scratch.title = read_string_utf16(br.ptr(0x100), 0x100);
-    scratch.title_ascii = read_string_cp932(br.ptr(0x40), 0x40);
-    scratch.genre = read_string_utf16(br.ptr(0x80), 0x80);
-    scratch.artist = read_string_utf16(br.ptr(0x100), 0x100);
-    scratch.subtitle = read_string_utf16(br.ptr(0x100), 0x100);
+    assign_utf16(scratch.title, br.ptr(0x100), 0x100);
+    assign_cp932(scratch.title_ascii, br.ptr(0x40), 0x40);
+    assign_utf16(scratch.genre, br.ptr(0x80), 0x80);
+    assign_utf16(scratch.artist, br.ptr(0x100), 0x100);
+    assign_utf16(scratch.subtitle, br.ptr(0x100), 0x100);
   } else {
-    scratch.title = read_string_cp932(br.ptr(0x40), 0x40);
-    scratch.title_ascii = read_string_cp932(br.ptr(0x40), 0x40);
-    scratch.genre = read_string_cp932(br.ptr(0x40), 0x40);
-    scratch.artist = read_string_cp932(br.ptr(0x40), 0x40);
+    assign_cp932(scratch.title, br.ptr(0x40), 0x40);
+    assign_cp932(scratch.title_ascii, br.ptr(0x40), 0x40);
+    assign_cp932(scratch.genre, br.ptr(0x40), 0x40);
+    assign_cp932(scratch.artist, br.ptr(0x40), 0x40);
   }
 
   const uint32_t texture_title = br.u32le();
@@ -606,7 +792,7 @@ static void append_one_song_from_bin_python(std::string& out, BinReader& br, uin
   const int16_t bga_delay = br.i16le();
   if (version <= 26 || version == 80) br.skip(2);
 
-  scratch.bga_filename = read_string_cp932(br.ptr(0x20), 0x20);
+  assign_cp932(scratch.bga_filename, br.ptr(0x20), 0x20);
   if (version == 80) br.skip(2);
 
   const uint32_t afp_flag = br.u32le();
@@ -614,8 +800,9 @@ static void append_one_song_from_bin_python(std::string& out, BinReader& br, uin
   out += "{\n";
   auto key = [&](const char* k) {
     append_indent_units(out, array_key_line_units + 2);
-    append_escaped_json_string(out, k);
-    out += ": ";
+    out.push_back('"');
+    out += k;
+    out += "\": ";
   };
   auto comma_nl = [&](bool more) {
     if (more)
@@ -785,6 +972,7 @@ struct JsonReader {
   const char* end = nullptr;
 
   explicit JsonReader(const std::string& s) : p(s.data()), end(s.data() + s.size()) {}
+  JsonReader(const char* data, size_t n) : p(data ? data : ""), end((data ? data : "") + (data ? n : 0)) {}
 
   bool eof() const { return p >= end; }
 
@@ -860,7 +1048,14 @@ struct JsonReader {
       return false;
     }
     ++p;
-    out.clear();
+    const char* start = p;
+    while (p < end && *p != '"' && *p != '\\') ++p;
+    if (p < end && *p == '"') {
+      out.assign(start, static_cast<size_t>(p - start));
+      ++p;
+      return true;
+    }
+    out.assign(start, static_cast<size_t>(p - start));
     while (!eof()) {
       unsigned char c = static_cast<unsigned char>(*p++);
       if (c == '"') return true;
@@ -910,6 +1105,34 @@ struct JsonReader {
     return false;
   }
 
+  // Schema keys are short and unescaped. too_long marks a key that cannot be one of ours.
+  bool read_key(char* buf, size_t cap, size_t& len, bool& too_long, std::wstring& err) {
+    skip_ws();
+    if (eof() || *p != '"') {
+      err = L"Invalid JSON (expected MusicDataPlugin schema): expected string.";
+      return false;
+    }
+    const char* saved = p;
+    ++p;
+    const char* start = p;
+    while (p < end && *p != '"' && *p != '\\') ++p;
+    if (p < end && *p == '"') {
+      size_t n = static_cast<size_t>(p - start);
+      ++p;
+      too_long = n > cap;
+      if (!too_long && n) memcpy(buf, start, n);
+      len = too_long ? 0 : n;
+      return true;
+    }
+    p = saved;
+    std::string tmp;
+    if (!read_string(tmp, err)) return false;
+    too_long = tmp.size() > cap;
+    if (!too_long && !tmp.empty()) memcpy(buf, tmp.data(), tmp.size());
+    len = too_long ? 0 : tmp.size();
+    return true;
+  }
+
   bool read_null(std::wstring& err) {
     skip_ws();
     if (end - p >= 4 && p[0] == 'n' && p[1] == 'u' && p[2] == 'l' && p[3] == 'l') {
@@ -920,37 +1143,84 @@ struct JsonReader {
     return false;
   }
 
-  bool read_number(double& out, std::wstring& err) {
+  bool read_i64(int64_t& out, std::wstring& err) {
     skip_ws();
     if (eof()) {
       err = L"Invalid JSON: expected number.";
       return false;
     }
     const char* start = p;
-    // Basic JSON number chars: [-+0-9.eE]
     if (*p == '-' || *p == '+') ++p;
+    const char* after_sign = p;
+    bool saw_digit = false;
+    bool integer_only = true;
     while (!eof()) {
       char c = *p;
-      if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+      if (c >= '0' && c <= '9') {
+        saw_digit = true;
+        ++p;
+        continue;
+      }
+      if (c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+        integer_only = false;
         ++p;
         continue;
       }
       break;
     }
-    if (p == start) {
+    if (!saw_digit || p == start) {
       err = L"Invalid JSON: expected number.";
       return false;
     }
-    char* endp = nullptr;
-    out = std::strtod(start, &endp);
-    if (!endp || endp != p) {
+    if (!integer_only) {
+      char* endp = nullptr;
+      const double d = std::strtod(start, &endp);
+      if (!endp || endp != p) {
+        err = L"Invalid JSON: bad number.";
+        return false;
+      }
+      if (!std::isfinite(d)) {
+        out = 0;
+        return true;
+      }
+      if (d >= 9223372036854775808.0) {
+        out = std::numeric_limits<int64_t>::max();
+        return true;
+      }
+      if (d < static_cast<double>(std::numeric_limits<int64_t>::min())) {
+        out = std::numeric_limits<int64_t>::min();
+        return true;
+      }
+      out = static_cast<int64_t>(d);
+      return true;
+    }
+    uint64_t mag = 0;
+    const auto res = std::from_chars(after_sign, p, mag);
+    if (res.ec == std::errc::result_out_of_range) {
+      out = (start[0] == '-') ? std::numeric_limits<int64_t>::min() : std::numeric_limits<int64_t>::max();
+      return true;
+    }
+    if (res.ec != std::errc{} || res.ptr != p) {
       err = L"Invalid JSON: bad number.";
       return false;
+    }
+    if (start[0] == '-') {
+      const uint64_t min_mag = static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1ull;
+      out = (mag >= min_mag) ? std::numeric_limits<int64_t>::min() : -static_cast<int64_t>(mag);
+    } else if (mag > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      out = std::numeric_limits<int64_t>::max();
+    } else {
+      out = static_cast<int64_t>(mag);
     }
     return true;
   }
 
-  bool skip_value(std::wstring& err) {
+  bool skip_value(std::wstring& err, int depth = 0) {
+    static constexpr int kMaxJsonDepth = 64;
+    if (depth > kMaxJsonDepth) {
+      err = L"Invalid JSON: nesting too deep.";
+      return false;
+    }
     skip_ws();
     if (eof()) {
       err = L"Invalid JSON: unexpected end.";
@@ -966,10 +1236,12 @@ struct JsonReader {
       skip_ws();
       if (consume('}')) return true;
       while (true) {
-        std::string k;
-        if (!read_string(k, err)) return false;
+        char kbuf[32];
+        size_t klen = 0;
+        bool too_long = false;
+        if (!read_key(kbuf, sizeof(kbuf), klen, too_long, err)) return false;
         if (!expect(':', err)) return false;
-        if (!skip_value(err)) return false;
+        if (!skip_value(err, depth + 1)) return false;
         if (consume('}')) return true;
         if (!expect(',', err)) return false;
       }
@@ -979,29 +1251,224 @@ struct JsonReader {
       skip_ws();
       if (consume(']')) return true;
       while (true) {
-        if (!skip_value(err)) return false;
+        if (!skip_value(err, depth + 1)) return false;
         if (consume(']')) return true;
         if (!expect(',', err)) return false;
       }
     }
     if (c == 'n') return read_null(err);
-    // number
-    double d = 0;
-    return read_number(d, err);
+    int64_t ignored = 0;
+    return read_i64(ignored, err);
   }
 };
 
-static int json_to_int(double d) {
-  if (!std::isfinite(d)) return 0;
-  if (d > static_cast<double>(std::numeric_limits<int>::max())) return std::numeric_limits<int>::max();
-  if (d < static_cast<double>(std::numeric_limits<int>::min())) return std::numeric_limits<int>::min();
-  return static_cast<int>(d);
+enum class SongField : uint8_t {
+  Unknown = 0,
+  SongId,
+  Title,
+  TitleAscii,
+  Genre,
+  Artist,
+  Subtitle,
+  TextureTitle,
+  TextureArtist,
+  TextureGenre,
+  TextureLoad,
+  TextureList,
+  TextureSubtitle,
+  FontIdx,
+  GameVersion,
+  OtherFolder,
+  BemaniFolder,
+  BeginnerRec,
+  IidxRec,
+  BemaniRec,
+  Splittable,
+  UnkUnused,
+  SPB_level,
+  SPN_level,
+  SPH_level,
+  SPA_level,
+  SPL_level,
+  DPB_level,
+  DPN_level,
+  DPH_level,
+  DPA_level,
+  DPL_level,
+  Volume,
+  SPB_ident,
+  SPN_ident,
+  SPH_ident,
+  SPA_ident,
+  SPL_ident,
+  DPB_ident,
+  DPN_ident,
+  DPH_ident,
+  DPA_ident,
+  DPL_ident,
+  BgaFilename,
+  BgaDelay,
+  AfpFlag,
+  AfpData,
+  DataVer,
+  Data,
+};
+
+static int chart_slot(const char* s) {
+  if (s[1] != 'P' || (s[0] != 'S' && s[0] != 'D')) return -1;
+  const int base = (s[0] == 'S') ? 0 : 5;
+  switch (s[2]) {
+    case 'B':
+      return base + 0;
+    case 'N':
+      return base + 1;
+    case 'H':
+      return base + 2;
+    case 'A':
+      return base + 3;
+    case 'L':
+      return base + 4;
+    default:
+      return -1;
+  }
 }
 
-static uint32_t json_to_u32(double d) {
-  if (!std::isfinite(d) || d < 0) return 0;
-  if (d > 4294967295.0) return 0xffffffffu;
-  return static_cast<uint32_t>(d);
+template <size_t N>
+static bool key_is(const char* s, size_t n, const char (&lit)[N]) {
+  return n == N - 1 && memcmp(s, lit, N - 1) == 0;
+}
+
+static SongField classify_field(const char* s, size_t n) {
+  switch (n) {
+    case sizeof("data") - 1:
+      if (key_is(s, n, "data")) return SongField::Data;
+      break;
+    case sizeof("title") - 1:
+      static_assert(sizeof("genre") == sizeof("title"));
+      if (key_is(s, n, "title")) return SongField::Title;
+      if (key_is(s, n, "genre")) return SongField::Genre;
+      break;
+    case sizeof("artist") - 1:
+      static_assert(sizeof("volume") == sizeof("artist"));
+      if (key_is(s, n, "artist")) return SongField::Artist;
+      if (key_is(s, n, "volume")) return SongField::Volume;
+      break;
+    case sizeof("song_id") - 1:
+      if (key_is(s, n, "song_id")) return SongField::SongId;
+      break;
+    case sizeof("font_idx") - 1:
+      static_assert(sizeof("subtitle") == sizeof("font_idx"));
+      static_assert(sizeof("afp_flag") == sizeof("font_idx"));
+      static_assert(sizeof("afp_data") == sizeof("font_idx"));
+      static_assert(sizeof("data_ver") == sizeof("font_idx"));
+      if (key_is(s, n, "subtitle")) return SongField::Subtitle;
+      if (key_is(s, n, "font_idx")) return SongField::FontIdx;
+      if (key_is(s, n, "afp_flag")) return SongField::AfpFlag;
+      if (key_is(s, n, "afp_data")) return SongField::AfpData;
+      if (key_is(s, n, "data_ver")) return SongField::DataVer;
+      break;
+    case sizeof("bga_delay") - 1: {
+      static_assert(sizeof("SPB_level") == sizeof("bga_delay"));
+      static_assert(sizeof("SPB_ident") == sizeof("bga_delay"));
+      if (key_is(s, n, "bga_delay")) return SongField::BgaDelay;
+      const int slot = chart_slot(s);
+      if (slot >= 0 && s[3] == '_') {
+        if (s[4] == 'l' && memcmp(s + 4, "level", 5) == 0)
+          return static_cast<SongField>(static_cast<int>(SongField::SPB_level) + slot);
+        if (s[4] == 'i' && memcmp(s + 4, "ident", 5) == 0)
+          return static_cast<SongField>(static_cast<int>(SongField::SPB_ident) + slot);
+      }
+      break;
+    }
+    case sizeof("unk_unused") - 1:
+      if (key_is(s, n, "unk_unused")) return SongField::UnkUnused;
+      break;
+    case sizeof("title_ascii") - 1:
+      if (key_is(s, n, "title_ascii")) return SongField::TitleAscii;
+      break;
+    case sizeof("texture_load") - 1:
+      static_assert(sizeof("texture_list") == sizeof("texture_load"));
+      static_assert(sizeof("game_version") == sizeof("texture_load"));
+      static_assert(sizeof("other_folder") == sizeof("texture_load"));
+      static_assert(sizeof("bga_filename") == sizeof("texture_load"));
+      if (key_is(s, n, "texture_load")) return SongField::TextureLoad;
+      if (key_is(s, n, "texture_list")) return SongField::TextureList;
+      if (key_is(s, n, "game_version")) return SongField::GameVersion;
+      if (key_is(s, n, "other_folder")) return SongField::OtherFolder;
+      if (key_is(s, n, "bga_filename")) return SongField::BgaFilename;
+      break;
+    case sizeof("texture_title") - 1:
+      static_assert(sizeof("texture_genre") == sizeof("texture_title"));
+      static_assert(sizeof("bemani_folder") == sizeof("texture_title"));
+      if (key_is(s, n, "texture_title")) return SongField::TextureTitle;
+      if (key_is(s, n, "texture_genre")) return SongField::TextureGenre;
+      if (key_is(s, n, "bemani_folder")) return SongField::BemaniFolder;
+      break;
+    case sizeof("texture_artist") - 1:
+      if (key_is(s, n, "texture_artist")) return SongField::TextureArtist;
+      break;
+    case sizeof("iidx_rec_folder") - 1:
+      static_assert(sizeof("splittable_diff") == sizeof("iidx_rec_folder"));
+      if (key_is(s, n, "splittable_diff")) return SongField::Splittable;
+      if (key_is(s, n, "iidx_rec_folder")) return SongField::IidxRec;
+      break;
+    case sizeof("texture_subtitle") - 1:
+      if (key_is(s, n, "texture_subtitle")) return SongField::TextureSubtitle;
+      break;
+    case sizeof("bemani_rec_folder") - 1:
+      if (key_is(s, n, "bemani_rec_folder")) return SongField::BemaniRec;
+      break;
+    case sizeof("beginner_rec_folder") - 1:
+      if (key_is(s, n, "beginner_rec_folder")) return SongField::BeginnerRec;
+      break;
+    default:
+      break;
+  }
+  return SongField::Unknown;
+}
+
+static int i64_to_int(int64_t v) {
+  if (v > static_cast<int64_t>(std::numeric_limits<int>::max())) return std::numeric_limits<int>::max();
+  if (v < static_cast<int64_t>(std::numeric_limits<int>::min())) return std::numeric_limits<int>::min();
+  return static_cast<int>(v);
+}
+
+static uint32_t i64_to_u32(int64_t v) {
+  if (v < 0) return 0;
+  if (static_cast<uint64_t>(v) > 4294967295ull) return 0xffffffffu;
+  return static_cast<uint32_t>(v);
+}
+
+static int SongData::* const kLevelMem[] = {
+    &SongData::SPB_level, &SongData::SPN_level, &SongData::SPH_level, &SongData::SPA_level, &SongData::SPL_level,
+    &SongData::DPB_level, &SongData::DPN_level, &SongData::DPH_level, &SongData::DPA_level, &SongData::DPL_level,
+};
+static int SongData::* const kIdentMem[] = {
+    &SongData::SPB_ident, &SongData::SPN_ident, &SongData::SPH_ident, &SongData::SPA_ident, &SongData::SPL_ident,
+    &SongData::DPB_ident, &SongData::DPN_ident, &SongData::DPH_ident, &SongData::DPA_ident, &SongData::DPL_ident,
+};
+
+static bool read_song_int(JsonReader& jr, int& dest, std::wstring& err) {
+  int64_t v = 0;
+  if (!jr.read_i64(v, err)) return false;
+  dest = i64_to_int(v);
+  return true;
+}
+
+static bool read_song_u32(JsonReader& jr, uint32_t& dest, std::wstring& err) {
+  int64_t v = 0;
+  if (!jr.read_i64(v, err)) return false;
+  dest = i64_to_u32(v);
+  return true;
+}
+
+static bool apply_chart_field(JsonReader& jr, SongData& out, SongField field, std::wstring& err) {
+  const int raw = static_cast<int>(field);
+  const int level0 = static_cast<int>(SongField::SPB_level);
+  const int ident0 = static_cast<int>(SongField::SPB_ident);
+  if (raw >= level0 && raw < level0 + 10) return read_song_int(jr, out.*kLevelMem[raw - level0], err);
+  if (raw >= ident0 && raw < ident0 + 10) return read_song_int(jr, out.*kIdentMem[raw - ident0], err);
+  return jr.skip_value(err);
 }
 
 static bool parse_song_object(JsonReader& jr, uint32_t version, SongData& out, std::wstring& err) {
@@ -1011,201 +1478,114 @@ static bool parse_song_object(JsonReader& jr, uint32_t version, SongData& out, s
   if (!jr.expect('{', err)) return false;
   if (jr.consume('}')) return true;
   while (true) {
-    std::string key;
-    if (!jr.read_string(key, err)) return false;
+    char key[32];
+    size_t key_len = 0;
+    bool too_long = false;
+    if (!jr.read_key(key, sizeof(key), key_len, too_long, err)) return false;
     if (!jr.expect(':', err)) return false;
 
-    if (key == "song_id") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.song_id = json_to_u32(d);
-    } else if (key == "title") {
-      if (!jr.read_string(out.title, err)) return false;
-    } else if (key == "title_ascii") {
-      if (!jr.read_string(out.title_ascii, err)) return false;
-    } else if (key == "genre") {
-      if (!jr.read_string(out.genre, err)) return false;
-    } else if (key == "artist") {
-      if (!jr.read_string(out.artist, err)) return false;
-    } else if (key == "subtitle") {
-      if (!jr.read_string(out.subtitle, err)) return false;
-    } else if (key == "texture_title") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.texture_title = json_to_u32(d);
-    } else if (key == "texture_artist") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.texture_artist = json_to_u32(d);
-    } else if (key == "texture_genre") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.texture_genre = json_to_u32(d);
-    } else if (key == "texture_load") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.texture_load = json_to_u32(d);
-    } else if (key == "texture_list") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.texture_list = json_to_u32(d);
-    } else if (key == "texture_subtitle") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.texture_subtitle = json_to_u32(d);
-    } else if (key == "font_idx") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.font_idx = json_to_u32(d);
-    } else if (key == "game_version") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.game_version = json_to_int(d);
-    } else if (key == "other_folder") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.other_folder = json_to_int(d);
-    } else if (key == "bemani_folder") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.bemani_folder = json_to_int(d);
-    } else if (key == "beginner_rec_folder") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.beginner_rec_folder = json_to_int(d);
-    } else if (key == "iidx_rec_folder") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.iidx_rec_folder = json_to_int(d);
-    } else if (key == "bemani_rec_folder") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.bemani_rec_folder = json_to_int(d);
-    } else if (key == "splittable_diff") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.splittable_diff = json_to_int(d);
-    } else if (key == "unk_unused") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.unk_unused = json_to_int(d);
-    } else if (key == "SPB_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPB_level = json_to_int(d);
-    } else if (key == "SPN_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPN_level = json_to_int(d);
-    } else if (key == "SPH_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPH_level = json_to_int(d);
-    } else if (key == "SPA_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPA_level = json_to_int(d);
-    } else if (key == "SPL_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPL_level = json_to_int(d);
-    } else if (key == "DPB_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPB_level = json_to_int(d);
-    } else if (key == "DPN_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPN_level = json_to_int(d);
-    } else if (key == "DPH_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPH_level = json_to_int(d);
-    } else if (key == "DPA_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPA_level = json_to_int(d);
-    } else if (key == "DPL_level") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPL_level = json_to_int(d);
-    } else if (key == "volume") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.volume = json_to_u32(d);
-    } else if (key == "SPB_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPB_ident = json_to_int(d);
-    } else if (key == "SPN_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPN_ident = json_to_int(d);
-    } else if (key == "SPH_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPH_ident = json_to_int(d);
-    } else if (key == "SPA_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPA_ident = json_to_int(d);
-    } else if (key == "SPL_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.SPL_ident = json_to_int(d);
-    } else if (key == "DPB_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPB_ident = json_to_int(d);
-    } else if (key == "DPN_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPN_ident = json_to_int(d);
-    } else if (key == "DPH_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPH_ident = json_to_int(d);
-    } else if (key == "DPA_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPA_ident = json_to_int(d);
-    } else if (key == "DPL_ident") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.DPL_ident = json_to_int(d);
-    } else if (key == "bga_filename") {
-      if (!jr.read_string(out.bga_filename, err)) return false;
-    } else if (key == "bga_delay") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.bga_delay = json_to_int(d);
-    } else if (key == "afp_flag") {
-      double d = 0;
-      if (!jr.read_number(d, err)) return false;
-      out.afp_flag = json_to_u32(d);
-    } else if (key == "afp_data") {
-      if (!jr.expect('[', err)) return false;
-      int idx = 0;
-      if (!jr.consume(']')) {
-        while (true) {
-          jr.skip_ws();
-          if (jr.peek('n')) {
-            if (!jr.read_null(err)) return false;
-            if (idx < 10) out.afp_data[static_cast<size_t>(idx)].clear();
-          } else {
-            std::string s;
-            if (!jr.read_string(s, err)) return false;
-            if (idx < 10) out.afp_data[static_cast<size_t>(idx)] = std::move(s);
+    const SongField field = too_long ? SongField::Unknown : classify_field(key, key_len);
+    switch (field) {
+      case SongField::SongId:
+        if (!read_song_u32(jr, out.song_id, err)) return false;
+        break;
+      case SongField::Title:
+        if (!jr.read_string(out.title, err)) return false;
+        break;
+      case SongField::TitleAscii:
+        if (!jr.read_string(out.title_ascii, err)) return false;
+        break;
+      case SongField::Genre:
+        if (!jr.read_string(out.genre, err)) return false;
+        break;
+      case SongField::Artist:
+        if (!jr.read_string(out.artist, err)) return false;
+        break;
+      case SongField::Subtitle:
+        if (!jr.read_string(out.subtitle, err)) return false;
+        break;
+      case SongField::TextureTitle:
+        if (!read_song_u32(jr, out.texture_title, err)) return false;
+        break;
+      case SongField::TextureArtist:
+        if (!read_song_u32(jr, out.texture_artist, err)) return false;
+        break;
+      case SongField::TextureGenre:
+        if (!read_song_u32(jr, out.texture_genre, err)) return false;
+        break;
+      case SongField::TextureLoad:
+        if (!read_song_u32(jr, out.texture_load, err)) return false;
+        break;
+      case SongField::TextureList:
+        if (!read_song_u32(jr, out.texture_list, err)) return false;
+        break;
+      case SongField::TextureSubtitle:
+        if (!read_song_u32(jr, out.texture_subtitle, err)) return false;
+        break;
+      case SongField::FontIdx:
+        if (!read_song_u32(jr, out.font_idx, err)) return false;
+        break;
+      case SongField::GameVersion:
+        if (!read_song_int(jr, out.game_version, err)) return false;
+        break;
+      case SongField::OtherFolder:
+        if (!read_song_int(jr, out.other_folder, err)) return false;
+        break;
+      case SongField::BemaniFolder:
+        if (!read_song_int(jr, out.bemani_folder, err)) return false;
+        break;
+      case SongField::BeginnerRec:
+        if (!read_song_int(jr, out.beginner_rec_folder, err)) return false;
+        break;
+      case SongField::IidxRec:
+        if (!read_song_int(jr, out.iidx_rec_folder, err)) return false;
+        break;
+      case SongField::BemaniRec:
+        if (!read_song_int(jr, out.bemani_rec_folder, err)) return false;
+        break;
+      case SongField::Splittable:
+        if (!read_song_int(jr, out.splittable_diff, err)) return false;
+        break;
+      case SongField::UnkUnused:
+        if (!read_song_int(jr, out.unk_unused, err)) return false;
+        break;
+      case SongField::Volume:
+        if (!read_song_u32(jr, out.volume, err)) return false;
+        break;
+      case SongField::BgaFilename:
+        if (!jr.read_string(out.bga_filename, err)) return false;
+        break;
+      case SongField::BgaDelay:
+        if (!read_song_int(jr, out.bga_delay, err)) return false;
+        break;
+      case SongField::AfpFlag:
+        if (!read_song_u32(jr, out.afp_flag, err)) return false;
+        break;
+      case SongField::AfpData: {
+        if (!jr.expect('[', err)) return false;
+        int idx = 0;
+        if (!jr.consume(']')) {
+          while (true) {
+            jr.skip_ws();
+            if (jr.peek('n')) {
+              if (!jr.read_null(err)) return false;
+              if (idx < 10) out.afp_data[static_cast<size_t>(idx)].clear();
+            } else {
+              std::string s;
+              if (!jr.read_string(s, err)) return false;
+              if (idx < 10) out.afp_data[static_cast<size_t>(idx)] = std::move(s);
+            }
+            ++idx;
+            if (jr.consume(']')) break;
+            if (!jr.expect(',', err)) return false;
           }
-          ++idx;
-          if (jr.consume(']')) break;
-          if (!jr.expect(',', err)) return false;
         }
+        out.afp_data_count = std::min(idx, 10);
+        break;
       }
-      out.afp_data_count = std::min(idx, 10);
-    } else {
-      // Unknown key: skip its value.
-      if (!jr.skip_value(err)) return false;
+      default:
+        if (!apply_chart_field(jr, out, field, err)) return false;
+        break;
     }
 
     if (jr.consume('}')) break;
@@ -1218,8 +1598,8 @@ static bool parse_song_object(JsonReader& jr, uint32_t version, SongData& out, s
   return true;
 }
 
-static bool parse_musicdata_root(const std::string& json_utf8, uint32_t& out_version, std::vector<SongData>& out_songs, std::wstring& err) {
-  JsonReader jr(json_utf8);
+static bool parse_musicdata_root(const char* json_utf8, size_t json_len, uint32_t& out_version, std::vector<SongData>& out_songs, std::wstring& err) {
+  JsonReader jr(json_utf8, json_len);
   out_songs.clear();
   out_version = 0;
 
@@ -1228,16 +1608,17 @@ static bool parse_musicdata_root(const std::string& json_utf8, uint32_t& out_ver
   bool have_data = false;
   if (!jr.consume('}')) {
     while (true) {
-      std::string key;
-      if (!jr.read_string(key, err)) return false;
+      char key[32];
+      size_t key_len = 0;
+      bool too_long = false;
+      if (!jr.read_key(key, sizeof(key), key_len, too_long, err)) return false;
       if (!jr.expect(':', err)) return false;
 
-      if (key == "data_ver") {
-        double d = 0;
-        if (!jr.read_number(d, err)) return false;
-        out_version = json_to_u32(d);
+      const SongField field = too_long ? SongField::Unknown : classify_field(key, key_len);
+      if (field == SongField::DataVer) {
+        if (!read_song_u32(jr, out_version, err)) return false;
         have_ver = true;
-      } else if (key == "data") {
+      } else if (field == SongField::Data) {
         if (!jr.expect('[', err)) return false;
         have_data = true;
         if (!jr.consume(']')) {
@@ -1274,17 +1655,13 @@ static bool parse_musicdata_root(const std::string& json_utf8, uint32_t& out_ver
   }
   return true;
 }
-
 }  // namespace
 
 }  // namespace
 
 bool musicdata_extract_json(const std::vector<uint8_t>& bin, std::string& out_json_utf8, std::wstring& err) {
   err.clear();
-  // Avoid repeated reallocations during pretty-print serialization.
-  // Typical output size is close to input size for music_*.bin, so this is a good lower bound.
   out_json_utf8.clear();
-  if (out_json_utf8.capacity() < bin.size() + (bin.size() / 4)) out_json_utf8.reserve(bin.size() + (bin.size() / 4));
   if (bin.size() < 16) {
     err = L"File too small.";
     return false;
@@ -1299,7 +1676,7 @@ bool musicdata_extract_json(const std::vector<uint8_t>& bin, std::string& out_js
     return false;
   }
 
-  BinReader br{bin.data(), bin.size(), 8};
+  BinReader br{bin.data(), bin.size(), 8, true};
   uint16_t available_entries = 0;
   uint32_t total_entries = 0;
   if (version >= 32) {
@@ -1311,21 +1688,49 @@ bool musicdata_extract_json(const std::vector<uint8_t>& bin, std::string& out_js
     total_entries = br.u32le();
     br.u16le();
   }
+  if (!br.ok) {
+    err = L"File truncated (header).";
+    return false;
+  }
 
-  size_t entry_sz = (version >= 32 && version != 80) ? 4u : 2u;
-  br.skip(static_cast<size_t>(total_entries) * entry_sz);
+  const size_t entry_sz = (version >= 32 && version != 80) ? 4u : 2u;
+  if (total_entries > (std::numeric_limits<size_t>::max() / entry_sz)) {
+    err = L"Corrupt header (index too large).";
+    return false;
+  }
+  const size_t index_bytes = static_cast<size_t>(total_entries) * entry_sz;
+  if (!br.require(index_bytes)) {
+    err = L"File truncated (index).";
+    return false;
+  }
+  br.skip(index_bytes);
+
+  const size_t record_bytes = song_record_bytes(version);
+  if (available_entries > 0 && record_bytes > (std::numeric_limits<size_t>::max() / available_entries)) {
+    err = L"Corrupt header (song count too large).";
+    return false;
+  }
+  const size_t songs_bytes = static_cast<size_t>(available_entries) * record_bytes;
+  if (!br.require(songs_bytes)) {
+    err = L"File truncated (song data).";
+    return false;
+  }
+
+  // Pretty JSON is mostly repeated keys, so size it from the song count and cap it if the header is nonsense.
+  {
+    size_t est = 128 + static_cast<size_t>(available_entries) * 3072u;
+    const size_t cap = bin.size() * 8 + 4096;
+    if (est > cap) est = cap;
+    const size_t floor_sz = bin.size() + bin.size() / 4;
+    if (est < floor_sz) est = floor_sz;
+    out_json_utf8.reserve(est);
+  }
 
   // Streaming JSON writer (skips DOM construction) while preserving the exact
   // indentation, commas, and key order of the legacy extract output.
-  out_json_utf8 += "{\n";
-  append_indent_units(out_json_utf8, 1);
-  append_escaped_json_string(out_json_utf8, "data_ver");
-  out_json_utf8 += ": ";
+  out_json_utf8 += "{\n    \"data_ver\": ";
   append_json_u32(out_json_utf8, version);
-  out_json_utf8 += ",\n";
-  append_indent_units(out_json_utf8, 1);
-  append_escaped_json_string(out_json_utf8, "data");
-  out_json_utf8 += ": ";
+  out_json_utf8 += ",\n    \"data\": ";
 
   if (available_entries == 0) {
     out_json_utf8 += "[]\n";
@@ -1336,9 +1741,18 @@ bool musicdata_extract_json(const std::vector<uint8_t>& bin, std::string& out_js
   out_json_utf8 += "[\n";
   SongScratch scratch{};
   for (uint32_t i = 0; i < available_entries; ++i) {
-    if (br.pos > br.size) break;
+    if (!br.require(record_bytes)) {
+      err = L"File truncated (song data).";
+      out_json_utf8.clear();
+      return false;
+    }
     append_indent_units(out_json_utf8, 2);
     append_one_song_from_bin_python(out_json_utf8, br, version, scratch, 1);
+    if (!br.ok) {
+      err = L"File truncated (song data).";
+      out_json_utf8.clear();
+      return false;
+    }
     if (i + 1 < available_entries)
       out_json_utf8 += ",\n";
     else
@@ -1350,12 +1764,16 @@ bool musicdata_extract_json(const std::vector<uint8_t>& bin, std::string& out_js
   return true;
 }
 
-bool musicdata_create_bin(const std::string& json_utf8, std::vector<uint8_t>& out_bin, std::wstring& err) {
+bool musicdata_create_bin(const char* json_utf8, size_t json_len, std::vector<uint8_t>& out_bin, std::wstring& err) {
   err.clear();
   out_bin.clear();
+  if (!json_utf8) {
+    err = L"Invalid JSON (expected MusicDataPlugin schema).";
+    return false;
+  }
   uint32_t version = 0;
   std::vector<SongData> songs;
-  if (!parse_musicdata_root(json_utf8, version, songs, err)) {
+  if (!parse_musicdata_root(json_utf8, json_len, version, songs, err)) {
     if (err.empty()) err = L"Invalid JSON (expected MusicDataPlugin schema).";
     return false;
   }
@@ -1367,4 +1785,8 @@ bool musicdata_create_bin(const std::string& json_utf8, std::vector<uint8_t>& ou
   writer_impl_typed(version, bw, songs);
   out_bin = std::move(bw.buf);
   return true;
+}
+
+bool musicdata_create_bin(const std::string& json_utf8, std::vector<uint8_t>& out_bin, std::wstring& err) {
+  return musicdata_create_bin(json_utf8.data(), json_utf8.size(), out_bin, err);
 }

@@ -10,7 +10,12 @@
 #define NPPM_GETPOSFROMBUFFERID (NPPMSG + 57)
 #define NPPM_ACTIVATEDOC (NPPMSG + 28)
 #define NPPM_SETBUFFERLANGTYPE (NPPMSG + 65)
+#define NPPM_GETBUFFERENCODING (NPPMSG + 66)
+#define NPPM_SETBUFFERENCODING (NPPMSG + 67)
 #define NPPM_MENUCOMMAND (NPPMSG + 48)
+
+// UniMode: UTF-8 without BOM. JSON written by this plugin has no BOM.
+#define NPP_UNI_UTF8_NO_BOM 4
 
 // menuCmdID.h (Notepad++): Encoding -> UTF-8
 #define NPP_IDM 40000
